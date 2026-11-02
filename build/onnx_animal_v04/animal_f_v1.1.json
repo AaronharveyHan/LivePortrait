@@ -1,0 +1,40 @@
+{
+  "model": "F",
+  "model_type": "appearance_feature_extractor",
+  "checkpoint_field": "checkpoint_F_animal",
+  "experimental": false,
+  "inputs": [
+    {
+      "name": "source_image",
+      "shape": [
+        1,
+        3,
+        256,
+        256
+      ],
+      "dtype": "float32"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "feature_3d",
+      "shape": [
+        1,
+        32,
+        16,
+        64,
+        64
+      ],
+      "dtype": "float32"
+    }
+  ],
+  "schema_version": 1,
+  "animal_version": "v1.1",
+  "opset_requested": 20,
+  "torch_version": "2.10.0+cpu",
+  "exporter": "dynamo",
+  "checkpoint_filename": "appearance_feature_extractor.pth",
+  "onnx_file": "animal_f_v1.1.onnx",
+  "onnx_checker_passed": true,
+  "runtime_cpu_parity_passed": true
+}
