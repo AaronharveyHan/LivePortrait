@@ -25,6 +25,7 @@ from .config.crop_config import CropConfig
 from .utils.cropper import Cropper
 from .utils.camera import get_rotation_matrix
 from .utils.video import images2video, concat_frames, get_fps, add_audio_to_video, has_audio_stream, video2gif
+from .utils.animal_stream_writer import AnimalStreamWriter
 from .utils.crop import _transform_img, prepare_paste_back, paste_back
 from .utils.io import load_image_rgb, load_video, resize_to_limit, dump, load
 from .utils.helper import mkdir, basename, dct2device, is_video, is_template, remove_suffix, is_image, calc_motion_multiplier
@@ -50,7 +51,7 @@ class LivePortraitPipelineAnimal(object):
         )
 
     def make_motion_template(self, I_lst, **kwargs):
-        n_frames = I_lst.shape[0]
+        n_frames = len(I_lst)
         template_dct = {
             'n_frames': n_frames,
             'output_fps': kwargs.get('output_fps', 25),
@@ -59,7 +60,9 @@ class LivePortraitPipelineAnimal(object):
 
         for i in track(range(n_frames), description='Making driving motion templates...', total=n_frames):
             # collect s, R, δ and t for inference
-            I_i = I_lst[i]
+            # Prepare one frame at a time; never upload the whole driving clip to the GPU.
+            I_i = (self.live_portrait_wrapper_animal.prepare_source(I_lst[i])
+                   if isinstance(I_lst, (list, tuple, np.ndarray)) else I_lst[i])
             x_i_info = self.live_portrait_wrapper_animal.get_kp_info(I_i)
             R_i = get_rotation_matrix(x_i_info['pitch'], x_i_info['yaw'], x_i_info['roll'])
 
@@ -79,6 +82,9 @@ class LivePortraitPipelineAnimal(object):
         inf_cfg = self.live_portrait_wrapper_animal.inference_cfg
         device = self.live_portrait_wrapper_animal.device
         crop_cfg = self.cropper.crop_cfg
+        stream_video = getattr(args, 'flag_stream_video', False)
+        save_concat_video = getattr(args, 'flag_save_concat_video', True)
+        save_gif = getattr(args, 'flag_save_gif', True)
         profile_enabled = os.getenv("LIVEPORTRAIT_PROFILE", "0").lower() in ("1", "true", "yes")
         profile_decode_ms = []
         cuda_device = str(device).startswith("cuda")
@@ -133,7 +139,8 @@ class LivePortraitPipelineAnimal(object):
             #######################################
 
             # save the motion template
-            I_d_lst = self.live_portrait_wrapper_animal.prepare_videos(driving_rgb_crop_256x256_lst)
+            # Keep driving frames on CPU; make_motion_template uploads one frame at a time.
+            I_d_lst = driving_rgb_crop_256x256_lst
             driving_template_dct = self.make_motion_template(I_d_lst, output_fps=output_fps)
 
             wfp_template = remove_suffix(args.driving) + '.pkl'
@@ -168,49 +175,76 @@ class LivePortraitPipelineAnimal(object):
             mask_ori_float = prepare_paste_back(inf_cfg.mask_crop, crop_info['M_c2o'], dsize=(img_rgb.shape[1], img_rgb.shape[0]))
 
         ######## animate ########
-        I_p_lst = []
+        I_p_lst = [] if not stream_video else None
+        pasteback_enabled = (inf_cfg.flag_pasteback and inf_cfg.flag_do_crop
+                             and inf_cfg.flag_stitching)
+        stream_writer = None
+        if stream_video:
+            mkdir(args.output_dir)
+            output_basename = f'{basename(args.source)}--{basename(args.driving)}'
+            stream_output = osp.join(args.output_dir, f'{output_basename}.mp4')
+            stream_concat = (osp.join(args.output_dir, f'{output_basename}_concat.mp4')
+                             if save_concat_video else None)
+            stream_writer = AnimalStreamWriter(
+                output_path=stream_output, concat_path=stream_concat,
+                fps=output_fps, source_image=img_crop_256x256
+            )
         animation_start = time.perf_counter() if profile_enabled else None
-        for i in track(range(n_frames), description='🚀Animating...', total=n_frames):
+        try:
+            for i in track(range(n_frames), description='🚀Animating...', total=n_frames):
 
-            x_d_i_info = driving_template_dct['motion'][i]
-            x_d_i_info = dct2device(x_d_i_info, device)
+                x_d_i_info = driving_template_dct['motion'][i]
+                x_d_i_info = dct2device(x_d_i_info, device)
 
-            R_d_i = x_d_i_info['R'] if 'R' in x_d_i_info.keys() else x_d_i_info['R_d']  # compatible with previous keys
-            delta_new = x_d_i_info['exp']
-            t_new = x_d_i_info['t']
-            t_new[..., 2].fill_(0)  # zero tz
-            scale_new = x_s_info['scale']
+                R_d_i = x_d_i_info['R'] if 'R' in x_d_i_info.keys() else x_d_i_info['R_d']  # compatible with previous keys
+                delta_new = x_d_i_info['exp']
+                t_new = x_d_i_info['t']
+                t_new[..., 2].fill_(0)  # zero tz
+                scale_new = x_s_info['scale']
 
-            x_d_i = scale_new * (x_c_s @ R_d_i + delta_new) + t_new
+                x_d_i = scale_new * (x_c_s @ R_d_i + delta_new) + t_new
 
-            if i == 0:
-                x_d_0 = x_d_i
-                motion_multiplier = calc_motion_multiplier(x_s, x_d_0)
+                if i == 0:
+                    x_d_0 = x_d_i
+                    motion_multiplier = calc_motion_multiplier(x_s, x_d_0)
 
-            x_d_diff = (x_d_i - x_d_0) * motion_multiplier
-            x_d_i = x_d_diff + x_s
+                x_d_diff = (x_d_i - x_d_0) * motion_multiplier
+                x_d_i = x_d_diff + x_s
 
-            if not inf_cfg.flag_stitching:
-                pass
-            else:
-                x_d_i = self.live_portrait_wrapper_animal.stitching(x_s, x_d_i)
+                if not inf_cfg.flag_stitching:
+                    pass
+                else:
+                    x_d_i = self.live_portrait_wrapper_animal.stitching(x_s, x_d_i)
 
-            x_d_i = x_s + (x_d_i - x_s) * inf_cfg.driving_multiplier
-            if profile_enabled:
-                if cuda_device:
-                    torch.cuda.synchronize(device)
-                decode_start = time.perf_counter()
-            out = self.live_portrait_wrapper_animal.warp_decode(f_s, x_s, x_d_i)
-            if profile_enabled:
-                if cuda_device:
-                    torch.cuda.synchronize(device)
-                profile_decode_ms.append((time.perf_counter() - decode_start) * 1000.0)
-            I_p_i = self.live_portrait_wrapper_animal.parse_output(out['out'])[0]
-            I_p_lst.append(I_p_i)
+                x_d_i = x_s + (x_d_i - x_s) * inf_cfg.driving_multiplier
+                if profile_enabled:
+                    if cuda_device:
+                        torch.cuda.synchronize(device)
+                    decode_start = time.perf_counter()
+                out = self.live_portrait_wrapper_animal.warp_decode(f_s, x_s, x_d_i)
+                if profile_enabled:
+                    if cuda_device:
+                        torch.cuda.synchronize(device)
+                    profile_decode_ms.append((time.perf_counter() - decode_start) * 1000.0)
+                I_p_i = self.live_portrait_wrapper_animal.parse_output(out['out'])[0]
+                if not stream_video:
+                    I_p_lst.append(I_p_i)
 
-            if inf_cfg.flag_pasteback and inf_cfg.flag_do_crop and inf_cfg.flag_stitching:
-                I_p_pstbk = paste_back(I_p_i, crop_info['M_c2o'], img_rgb, mask_ori_float)
-                I_p_pstbk_lst.append(I_p_pstbk)
+                if inf_cfg.flag_pasteback and inf_cfg.flag_do_crop and inf_cfg.flag_stitching:
+                    I_p_pstbk = paste_back(I_p_i, crop_info['M_c2o'], img_rgb, mask_ori_float)
+                    if not stream_video:
+                        I_p_pstbk_lst.append(I_p_pstbk)
+
+                if stream_writer is not None:
+                    stream_writer.write(
+                        I_p_i,
+                        output_frame=I_p_pstbk if pasteback_enabled else I_p_i,
+                        driving_frame=(driving_rgb_crop_256x256_lst[i]
+                                       if driving_rgb_crop_256x256_lst is not None else None),
+                    )
+        finally:
+            if stream_writer is not None:
+                stream_writer.close()
 
         if profile_enabled:
             animation_elapsed = time.perf_counter() - animation_start
@@ -226,37 +260,32 @@ class LivePortraitPipelineAnimal(object):
                     f"{allocated:.1f}/{reserved:.1f} MiB")
 
         mkdir(args.output_dir)
-        wfp_concat = None
         flag_driving_has_audio = (not flag_load_from_template) and has_audio_stream(args.driving)
+        video_name = f'{basename(args.source)}--{basename(args.driving)}'
+        wfp = osp.join(args.output_dir, f'{video_name}.mp4')
+        wfp_concat = (osp.join(args.output_dir, f'{video_name}_concat.mp4')
+                      if save_concat_video else None)
 
-        ######### build the final concatenation result #########
-        # driving frame | source image | generation
-        frames_concatenated = concat_frames(driving_rgb_crop_256x256_lst, [img_crop_256x256], I_p_lst)
-        wfp_concat = osp.join(args.output_dir, f'{basename(args.source)}--{basename(args.driving)}_concat.mp4')
-        images2video(frames_concatenated, wfp=wfp_concat, fps=output_fps)
+        # The non-streaming path preserves the original batch encoding behavior.
+        if not stream_video:
+            if save_concat_video:
+                frames_concatenated = concat_frames(
+                    driving_rgb_crop_256x256_lst, [img_crop_256x256], I_p_lst
+                )
+                images2video(frames_concatenated, wfp=wfp_concat, fps=output_fps)
+            if I_p_pstbk_lst is not None and len(I_p_pstbk_lst) > 0:
+                images2video(I_p_pstbk_lst, wfp=wfp, fps=output_fps)
+            else:
+                images2video(I_p_lst, wfp=wfp, fps=output_fps)
 
         if flag_driving_has_audio:
-            # final result with concatenation
-            wfp_concat_with_audio = osp.join(args.output_dir, f'{basename(args.source)}--{basename(args.driving)}_concat_with_audio.mp4')
-            audio_from_which_video = args.driving
-            add_audio_to_video(wfp_concat, audio_from_which_video, wfp_concat_with_audio)
-            os.replace(wfp_concat_with_audio, wfp_concat)
-            log(f"Replace {wfp_concat_with_audio} with {wfp_concat}")
-
-        # save the animated result
-        wfp = osp.join(args.output_dir, f'{basename(args.source)}--{basename(args.driving)}.mp4')
-        if I_p_pstbk_lst is not None and len(I_p_pstbk_lst) > 0:
-            images2video(I_p_pstbk_lst, wfp=wfp, fps=output_fps)
-        else:
-            images2video(I_p_lst, wfp=wfp, fps=output_fps)
-
-        ######### build the final result #########
-        if flag_driving_has_audio:
-            wfp_with_audio = osp.join(args.output_dir, f'{basename(args.source)}--{basename(args.driving)}_with_audio.mp4')
-            audio_from_which_video = args.driving
-            add_audio_to_video(wfp, audio_from_which_video, wfp_with_audio)
+            if save_concat_video:
+                wfp_concat_with_audio = osp.join(args.output_dir, f'{video_name}_concat_with_audio.mp4')
+                add_audio_to_video(wfp_concat, args.driving, wfp_concat_with_audio)
+                os.replace(wfp_concat_with_audio, wfp_concat)
+            wfp_with_audio = osp.join(args.output_dir, f'{video_name}_with_audio.mp4')
+            add_audio_to_video(wfp, args.driving, wfp_with_audio)
             os.replace(wfp_with_audio, wfp)
-            log(f"Replace {wfp_with_audio} with {wfp}")
 
         # final log
         if wfp_template not in (None, ''):
@@ -265,8 +294,9 @@ class LivePortraitPipelineAnimal(object):
         log(f'Animated video with concat: {wfp_concat}')
 
         # build the gif
-        wfp_gif = video2gif(wfp)
-        log(f'Animated gif: {wfp_gif}')
+        wfp_gif = video2gif(wfp) if save_gif else None
+        if wfp_gif is not None:
+            log(f'Animated gif: {wfp_gif}')
 
 
         return wfp, wfp_concat, wfp_gif

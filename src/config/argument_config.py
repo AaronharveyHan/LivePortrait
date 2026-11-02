@@ -23,6 +23,9 @@ class ArgumentConfig(PrintableConfig):
     device_id: int = 0  # gpu device id
     flag_force_cpu: bool = False  # force cpu inference, WIP!
     flag_detectors_cpu: bool = False  # run animal/human landmark detectors on CPU, keep F/M/W/G on GPU
+    flag_stream_video: bool = False  # animal only: encode frames immediately instead of retaining all outputs
+    flag_save_concat_video: bool = True  # animal only: include the diagnostic side-by-side video
+    flag_save_gif: bool = True  # animal only: generate GIF preview after MP4 encoding
     flag_normalize_lip: bool = False  # whether to let the lip to close state before animation, only take effect when flag_eye_retargeting and flag_lip_retargeting is False
     flag_source_video_eye_retargeting: bool = False  # when the input is a source video, whether to let the eye-open scalar of each frame to be the same as the first source frame before the animation, only take effect when flag_eye_retargeting and flag_lip_retargeting is False, may cause the inter-frame jittering
     flag_eye_retargeting: bool = False  # not recommend to be True, WIP; whether to transfer the eyes-open ratio of each driving frame to the source image or the corresponding source frame
