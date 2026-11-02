@@ -24,6 +24,9 @@ if str(ROOT) not in sys.path:
 
 from src.utils.animal_onnx_contract import get_contract
 from src.utils.animal_onnx_validation import inspect_model_files, validate_ort_io
+from src.utils.animal_mouth_enhancement import (
+    MouthEnhanceConfig, parse_index_csv, validate_mouth_config,
+)
 
 MODEL_NAMES = ('f', 'm', 'w', 'g')
 
@@ -40,10 +43,39 @@ def parse_args(argv=None):
     p.add_argument('--threads', type=int, default=4)
     p.add_argument('--seed', type=int, default=17)
     p.add_argument('--driving-multiplier', type=float, default=1.0)
+    p.add_argument('--mouth-kp-indices', type=str, default='',
+                   help='0-based learned KP indices to affect; NO known anatomical mapping')
+    p.add_argument('--mouth-lower-kp-indices', type=str, default='',
+                   help='Subset of --mouth-kp-indices for signed Y shift (experimental)')
+    p.add_argument('--mouth-x-scale', type=float, default=1.0)
+    p.add_argument('--mouth-y-scale', type=float, default=1.0)
+    p.add_argument('--mouth-z-scale', type=float, default=1.0)
+    p.add_argument('--mouth-lower-y-bias', type=float, default=0.0,
+                   help='Signed offset in latent KP Y; positive is NOT guaranteed jaw-down')
+    p.add_argument('--dump-kp-json', type=Path, default=None,
+                   help='Optional JSON dump of 21 learned KPs before/after enhancement')
     p.add_argument('--output', type=Path, default=ROOT / 'build/onnx_animal_v06/frame.png')
     p.add_argument('--report-json', type=Path, default=None)
     p.add_argument('--overwrite', action='store_true', help='Allow replacing the PNG/report')
     return p.parse_args(argv)
+
+
+def build_mouth_config(args):
+    mouth = parse_index_csv(args.mouth_kp_indices)
+    lower = parse_index_csv(args.mouth_lower_kp_indices)
+    changed = (bool(mouth or lower) or
+               (args.mouth_x_scale, args.mouth_y_scale, args.mouth_z_scale) != (1.0, 1.0, 1.0) or
+               args.mouth_lower_y_bias != 0.0)
+    cfg = MouthEnhanceConfig(
+        enabled=changed,
+        mouth_kp_indices=mouth,
+        lower_mouth_kp_indices=lower,
+        x_scale=args.mouth_x_scale,
+        y_scale=args.mouth_y_scale,
+        z_scale=args.mouth_z_scale,
+        lower_y_bias=args.mouth_lower_y_bias,
+    )
+    return validate_mouth_config(cfg)
 
 
 def validate_args(args):
@@ -51,6 +83,7 @@ def validate_args(args):
         raise ValueError('--threads must be >= 1')
     if not math.isfinite(args.driving_multiplier) or args.driving_multiplier < 0:
         raise ValueError('--driving-multiplier must be finite and >= 0')
+    build_mouth_config(args)  # reject unknown/malformed indices before model loading
     if args.plan:
         return
     if args.synthetic:
@@ -62,9 +95,16 @@ def validate_args(args):
         raise ValueError('--output must be a .png path')
     if args.report_json is not None and args.report_json.suffix.lower() != '.json':
         raise ValueError('--report-json must be a .json path')
-    if args.report_json is not None and args.report_json.resolve() == args.output.resolve():
-        raise ValueError('Report path and PNG path must differ')
-    for path in (args.output, args.report_json):
+    if args.dump_kp_json is not None and args.dump_kp_json.suffix.lower() != '.json':
+        raise ValueError('--dump-kp-json must be a .json path')
+    outputs = [p for p in (args.output, args.report_json, args.dump_kp_json) if p is not None]
+    if len({p.resolve() for p in outputs}) != len(outputs):
+        raise ValueError('PNG, report and keypoint dump paths must be different')
+    if not args.synthetic:
+        input_paths = {p.resolve() for p in (args.source, args.driving_first, args.driving_target)}
+        if any(p.resolve() in input_paths for p in outputs):
+            raise ValueError('Output path cannot overwrite input photo')
+    for path in outputs:
         if path is not None and path.exists() and not args.overwrite:
             raise FileExistsError('{} exists; add --overwrite to replace'.format(path))
     if not args.synthetic:
@@ -198,13 +238,16 @@ def main(argv=None):
     sessions = open_sessions(args, ort)
     load_ms = (time.perf_counter() - started) * 1000.0
     rss_loaded = _rss_mib()
+    mouth_cfg = build_mouth_config(args)
     result = run_one_frame(sessions, frames[0], frames[1], frames[2],
-                           driving_multiplier=args.driving_multiplier)
+                           driving_multiplier=args.driving_multiplier,
+                           mouth_cfg=mouth_cfg)
     rss_done = _rss_mib()
     report = {'schema_version': 1, 'stage': 'v0.6_single_frame',
               'mode': 'synthetic_smoke' if args.synthetic else 'real_pre_cropped_images',
               'source': [str(x) for x in (args.source, args.driving_first, args.driving_target)] if not args.synthetic else None,
               'image_preprocess': frames[3], 'threads': args.threads,
+              'mouth_enhancement': mouth_cfg.as_dict(),
               'ort_session_init_ms': load_ms,
               'rss_mib': {'before_sessions': rss_before,
                           'after_sessions': rss_loaded, 'after_inference': rss_done},
@@ -215,6 +258,21 @@ def main(argv=None):
     args.output.parent.mkdir(parents=True, exist_ok=True)
     _save_png(args.output, result['rgb'])
     report['output_png'] = str(args.output)
+    if args.dump_kp_json is not None:
+        kps = result['keypoints']
+        before = kps.get('driving_before_mouth', kps['driving'])
+        kp_payload = {
+            'schema_version': 1,
+            'note': '21 learned IMPLICIT keypoints; indices have no confirmed mouth/jaw semantics.',
+            'mouth_enhancement': mouth_cfg.as_dict(),
+            'source': kps['source'].tolist(),
+            'driving_before_mouth': before.tolist(),
+            'driving_after_mouth': kps['driving'].tolist(),
+            'delta_after_minus_before': (kps['driving'] - before).tolist(),
+        }
+        args.dump_kp_json.parent.mkdir(parents=True, exist_ok=True)
+        args.dump_kp_json.write_text(json.dumps(kp_payload, indent=2, allow_nan=False) + '\n', encoding='utf-8')
+        report['keypoint_json'] = str(args.dump_kp_json)
     if args.report_json is not None:
         serialized = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + '\n'
         args.report_json.parent.mkdir(parents=True, exist_ok=True)

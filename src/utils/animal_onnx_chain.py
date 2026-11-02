@@ -169,9 +169,15 @@ def execute_onnx(session, code, *inputs):
             for spec, v in zip(contract.outputs, got)}
 
 
-def run_one_frame(sessions, source_rgb, first_rgb, target_rgb, *, driving_multiplier=1.0):
+def run_one_frame(sessions, source_rgb, first_rgb, target_rgb, *, driving_multiplier=1.0, mouth_cfg=None):
     """F(source) + M(source, first, target) + W + G, return RGB image and metrics."""
     np = _np()
+    from .animal_mouth_enhancement import (
+        MouthEnhanceConfig, validate_mouth_config, apply_mouth_enhancement,
+    )
+    if mouth_cfg is None:
+        mouth_cfg = MouthEnhanceConfig()
+    validate_mouth_config(mouth_cfg)
     missing = set(MODELS) - set(sessions)
     if missing:
         raise ValueError('Missing ONNX sessions: {}'.format(','.join(sorted(missing))))
@@ -193,13 +199,15 @@ def run_one_frame(sessions, source_rgb, first_rgb, target_rgb, *, driving_multip
     m_target = timed('M_target', lambda: motion_info(execute_onnx(sessions['m'], 'm', target)))
     x_s, x_d, multiplier = timed('motion_postprocess', lambda: relative_target(
         m_source, m_first, m_target, driving_multiplier=driving_multiplier))
+    driving_before_mouth = None
+    if mouth_cfg.enabled:
+        driving_before_mouth = x_d.copy()
+        x_d = timed('mouth_enhancement', lambda: apply_mouth_enhancement(x_s, x_d, mouth_cfg))
     warped = timed('W', lambda: execute_onnx(sessions['w'], 'w', fs, x_d, x_s)['warped_feature'])
     generated = timed('G', lambda: execute_onnx(sessions['g'], 'g', warped)['output_image'])
     rgb = timed('RGB_output', lambda: output_rgb(generated))
     total_ms = (time.perf_counter() - start_all) * 1000.0
-    return {
-        'rgb': rgb,
-        'metrics': {
+    metrics = {
             'provider': 'CPUExecutionProvider', 'model_version': 'animal_v1.1',
             'batch': 1, 'dtype': 'float32',
             'cropping': False, 'stitching': False, 'pasteback': False,
@@ -207,6 +215,10 @@ def run_one_frame(sessions, source_rgb, first_rgb, target_rgb, *, driving_multip
             'convex_hull_multiplier': multiplier,
             'stages_ms': stages_ms, 'total_inference_ms': total_ms,
             'image_size': list(rgb.shape),
-        },
-        'keypoints': {'source': x_s, 'driving': x_d},
     }
+    if mouth_cfg.enabled:
+        metrics['mouth_enhancement'] = mouth_cfg.as_dict()
+    keypoints = {'source': x_s, 'driving': x_d}
+    if driving_before_mouth is not None:
+        keypoints['driving_before_mouth'] = driving_before_mouth
+    return {'rgb': rgb, 'metrics': metrics, 'keypoints': keypoints}
