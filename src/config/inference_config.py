@@ -48,6 +48,7 @@ class InferenceConfig(PrintableConfig):
     flag_do_crop: bool = True
     flag_do_rot: bool = True
     flag_force_cpu: bool = False
+    flag_detectors_cpu: bool = False  # reduce GPU VRAM usage when animal face detection is requested
     flag_do_torch_compile: bool = False
     driving_option: str = "pose-friendly" # "expression-friendly" or "pose-friendly"
     driving_multiplier: float = 1.0

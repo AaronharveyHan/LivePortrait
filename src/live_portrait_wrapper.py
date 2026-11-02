@@ -368,13 +368,9 @@ class LivePortraitWrapperAnimal(LivePortraitWrapper):
         # init G
         self.spade_generator = load_model(inference_cfg.checkpoint_G_animal, model_config, self.device, 'spade_generator')
         log(f'Load spade_generator from {osp.realpath(inference_cfg.checkpoint_G_animal)} done.')
-        # init S and R
-        if inference_cfg.checkpoint_S_animal is not None and osp.exists(inference_cfg.checkpoint_S_animal):
-            self.stitching_retargeting_module = load_model(inference_cfg.checkpoint_S_animal, model_config, self.device, 'stitching_retargeting_module')
-            log(f'Load stitching_retargeting_module from {osp.realpath(inference_cfg.checkpoint_S_animal)} done.')
-        else:
-            self.stitching_retargeting_module = None
-
+        # The stitching/retargeting weights can be loaded on first use.
+        self.stitching_retargeting_module = None
+        self._animal_model_config = model_config
         # Optimize for inference
         if self.compile:
             torch._dynamo.config.suppress_errors = True  # Suppress errors and fall back to eager execution
@@ -382,3 +378,18 @@ class LivePortraitWrapperAnimal(LivePortraitWrapper):
             self.spade_generator = torch.compile(self.spade_generator, mode='max-autotune')
 
         self.timer = Timer()
+
+    def stitching(self, kp_source: torch.Tensor, kp_driving: torch.Tensor) -> torch.Tensor:
+        # Called only when stitching is requested by the animal pipeline.
+        # Avoid keeping the optional S model in VRAM otherwise.
+        if self.stitching_retargeting_module is None:
+            checkpoint = self.inference_cfg.checkpoint_S_animal
+            if checkpoint is not None and osp.exists(checkpoint):
+                self.stitching_retargeting_module = load_model(
+                    checkpoint,
+                    self._animal_model_config,
+                    self.device,
+                    'stitching_retargeting_module',
+                )
+                log(f'Load animal stitching module from {osp.realpath(checkpoint)} done.')
+        return super().stitching(kp_source, kp_driving)

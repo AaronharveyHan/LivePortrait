@@ -42,48 +42,71 @@ class Cropper(object):
     def __init__(self, **kwargs) -> None:
         self.crop_cfg: CropConfig = kwargs.get("crop_cfg", None)
         self.image_type = kwargs.get("image_type", 'human_face')
-        device_id = kwargs.get("device_id", 0)
-        flag_force_cpu = kwargs.get("flag_force_cpu", False)
-        if flag_force_cpu:
+        self.device_id = kwargs.get("device_id", 0)
+        self.flag_force_cpu = kwargs.get("flag_force_cpu", False)
+        self.flag_detectors_cpu = kwargs.get("flag_detectors_cpu", False)
+        self.flag_use_half_precision = kwargs.get("flag_use_half_precision", True)
+
+        # Defer model allocation/warmup until a detection method is used.
+        # A pre-cropped animal image with a .pkl motion template needs none of
+        # InsightFace, HumanLandmark or XPose to generate its animation.
+        self.face_analysis_wrapper = None
+        self.human_landmark_runner = None
+        self.animal_landmark_runner = None
+
+    def _ensure_human_models(self):
+        if self.face_analysis_wrapper is not None and self.human_landmark_runner is not None:
+            return
+
+        if self.flag_force_cpu or self.flag_detectors_cpu:
             device = "cpu"
-            face_analysis_wrapper_provider = ["CPUExecutionProvider"]
+            providers = ["CPUExecutionProvider"]
         else:
             try:
                 if torch.backends.mps.is_available():
-                    # Shape inference currently fails with CoreMLExecutionProvider
-                    # for the retinaface model
                     device = "mps"
-                    face_analysis_wrapper_provider = ["CPUExecutionProvider"]
+                    providers = ["CPUExecutionProvider"]
                 else:
                     device = "cuda"
-                    face_analysis_wrapper_provider = ["CUDAExecutionProvider"]
-            except:
-                    device = "cuda"
-                    face_analysis_wrapper_provider = ["CUDAExecutionProvider"]
+                    providers = ["CUDAExecutionProvider"]
+            except Exception:
+                device = "cuda"
+                providers = ["CUDAExecutionProvider"]
+
         self.face_analysis_wrapper = FaceAnalysisDIY(
-                    name="buffalo_l",
-                    root=self.crop_cfg.insightface_root,
-                    providers=face_analysis_wrapper_provider,
-                )
-        self.face_analysis_wrapper.prepare(ctx_id=device_id, det_size=(512, 512), det_thresh=self.crop_cfg.det_thresh)
+            name="buffalo_l",
+            root=self.crop_cfg.insightface_root,
+            providers=providers,
+        )
+        self.face_analysis_wrapper.prepare(
+            ctx_id=self.device_id,
+            det_size=(512, 512),
+            det_thresh=self.crop_cfg.det_thresh,
+        )
         self.face_analysis_wrapper.warmup()
 
         self.human_landmark_runner = HumanLandmark(
             ckpt_path=self.crop_cfg.landmark_ckpt_path,
             onnx_provider=device,
-            device_id=device_id,
+            device_id=self.device_id,
         )
         self.human_landmark_runner.warmup()
 
-        if self.image_type == "animal_face":
-            from .animal_landmark_runner import XPoseRunner as AnimalLandmarkRunner
-            self.animal_landmark_runner = AnimalLandmarkRunner(
-                    model_config_path=self.crop_cfg.xpose_config_file_path,
-                    model_checkpoint_path=self.crop_cfg.xpose_ckpt_path,
-                    embeddings_cache_path=self.crop_cfg.xpose_embedding_cache_path,
-                    flag_use_half_precision=kwargs.get("flag_use_half_precision", True),
-                )
-            self.animal_landmark_runner.warmup()
+    def _ensure_animal_model(self):
+        if self.animal_landmark_runner is not None:
+            return
+        from .animal_landmark_runner import XPoseRunner as AnimalLandmarkRunner
+
+        cpu_only = self.flag_force_cpu or self.flag_detectors_cpu
+        self.animal_landmark_runner = AnimalLandmarkRunner(
+            model_config_path=self.crop_cfg.xpose_config_file_path,
+            model_checkpoint_path=self.crop_cfg.xpose_ckpt_path,
+            embeddings_cache_path=self.crop_cfg.xpose_embedding_cache_path,
+            device_id=self.device_id,
+            cpu_only=cpu_only,
+            flag_use_half_precision=self.flag_use_half_precision and not cpu_only,
+        )
+        self.animal_landmark_runner.warmup()
 
     def update_config(self, user_args):
         for k, v in user_args.items():
@@ -92,6 +115,10 @@ class Cropper(object):
 
     def crop_source_image(self, img_rgb_: np.ndarray, crop_cfg: CropConfig):
         # crop a source image and get neccessary information
+        if self.image_type == "human_face":
+            self._ensure_human_models()
+        else:
+            self._ensure_animal_model()
         img_rgb = img_rgb_.copy()  # copy it
         img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
@@ -151,6 +178,7 @@ class Cropper(object):
         return ret_dct
 
     def calc_lmk_from_cropped_image(self, img_rgb_, **kwargs):
+        self._ensure_human_models()
         direction = kwargs.get("direction", "large-small")
         src_face = self.face_analysis_wrapper.get(
             contiguous(img_rgb_[..., ::-1]),  # convert to BGR
@@ -171,6 +199,7 @@ class Cropper(object):
     # TODO: support skipping frame with NO FACE
     def crop_source_video(self, source_rgb_lst, crop_cfg: CropConfig, **kwargs):
         """Tracking based landmarks/alignment and cropping"""
+        self._ensure_human_models()
         trajectory = Trajectory()
         direction = kwargs.get("direction", "large-small")
         for idx, frame_rgb in enumerate(source_rgb_lst):
@@ -224,6 +253,7 @@ class Cropper(object):
 
     def crop_driving_video(self, driving_rgb_lst, **kwargs):
         """Tracking based landmarks/alignment and cropping"""
+        self._ensure_human_models()
         trajectory = Trajectory()
         direction = kwargs.get("direction", "large-small")
         for idx, frame_rgb in enumerate(driving_rgb_lst):
@@ -284,6 +314,7 @@ class Cropper(object):
 
     def calc_lmks_from_cropped_video(self, driving_rgb_crop_lst, **kwargs):
         """Tracking based landmarks/alignment"""
+        self._ensure_human_models()
         trajectory = Trajectory()
         direction = kwargs.get("direction", "large-small")
 

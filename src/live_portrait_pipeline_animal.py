@@ -15,6 +15,7 @@ torch.backends.cudnn.benchmark = True # disable CUDNN_BACKEND_EXECUTION_PLAN_DES
 import cv2; cv2.setNumThreads(0); cv2.ocl.setUseOpenCL(False)
 import numpy as np
 import os
+import time
 import os.path as osp
 from rich.progress import track
 
@@ -39,7 +40,14 @@ class LivePortraitPipelineAnimal(object):
 
     def __init__(self, inference_cfg: InferenceConfig, crop_cfg: CropConfig):
         self.live_portrait_wrapper_animal: LivePortraitWrapperAnimal = LivePortraitWrapperAnimal(inference_cfg=inference_cfg)
-        self.cropper: Cropper = Cropper(crop_cfg=crop_cfg, image_type='animal_face', flag_use_half_precision=inference_cfg.flag_use_half_precision)
+        self.cropper: Cropper = Cropper(
+            crop_cfg=crop_cfg,
+            image_type='animal_face',
+            flag_use_half_precision=inference_cfg.flag_use_half_precision,
+            flag_force_cpu=inference_cfg.flag_force_cpu,
+            flag_detectors_cpu=inference_cfg.flag_detectors_cpu,
+            device_id=inference_cfg.device_id,
+        )
 
     def make_motion_template(self, I_lst, **kwargs):
         n_frames = I_lst.shape[0]
@@ -71,6 +79,11 @@ class LivePortraitPipelineAnimal(object):
         inf_cfg = self.live_portrait_wrapper_animal.inference_cfg
         device = self.live_portrait_wrapper_animal.device
         crop_cfg = self.cropper.crop_cfg
+        profile_enabled = os.getenv("LIVEPORTRAIT_PROFILE", "0").lower() in ("1", "true", "yes")
+        profile_decode_ms = []
+        cuda_device = str(device).startswith("cuda")
+        if profile_enabled and cuda_device:
+            torch.cuda.reset_peak_memory_stats(device)
 
         ######## load source input ########
         if is_image(args.source):
@@ -111,7 +124,7 @@ class LivePortraitPipelineAnimal(object):
             if inf_cfg.flag_crop_driving_video:
                 ret_d = self.cropper.crop_driving_video(driving_rgb_lst)
                 log(f'Driving video is cropped, {len(ret_d["frame_crop_lst"])} frames are processed.')
-                if len(ret_d["frame_crop_lst"]) is not n_frames:
+                if len(ret_d["frame_crop_lst"]) != n_frames:
                     n_frames = min(n_frames, len(ret_d["frame_crop_lst"]))
                 driving_rgb_crop_lst = ret_d['frame_crop_lst']
                 driving_rgb_crop_256x256_lst = [cv2.resize(_, (256, 256)) for _ in driving_rgb_crop_lst]
@@ -156,6 +169,7 @@ class LivePortraitPipelineAnimal(object):
 
         ######## animate ########
         I_p_lst = []
+        animation_start = time.perf_counter() if profile_enabled else None
         for i in track(range(n_frames), description='🚀Animating...', total=n_frames):
 
             x_d_i_info = driving_template_dct['motion'][i]
@@ -182,13 +196,34 @@ class LivePortraitPipelineAnimal(object):
                 x_d_i = self.live_portrait_wrapper_animal.stitching(x_s, x_d_i)
 
             x_d_i = x_s + (x_d_i - x_s) * inf_cfg.driving_multiplier
+            if profile_enabled:
+                if cuda_device:
+                    torch.cuda.synchronize(device)
+                decode_start = time.perf_counter()
             out = self.live_portrait_wrapper_animal.warp_decode(f_s, x_s, x_d_i)
+            if profile_enabled:
+                if cuda_device:
+                    torch.cuda.synchronize(device)
+                profile_decode_ms.append((time.perf_counter() - decode_start) * 1000.0)
             I_p_i = self.live_portrait_wrapper_animal.parse_output(out['out'])[0]
             I_p_lst.append(I_p_i)
 
             if inf_cfg.flag_pasteback and inf_cfg.flag_do_crop and inf_cfg.flag_stitching:
                 I_p_pstbk = paste_back(I_p_i, crop_info['M_c2o'], img_rgb, mask_ori_float)
                 I_p_pstbk_lst.append(I_p_pstbk)
+
+        if profile_enabled:
+            animation_elapsed = time.perf_counter() - animation_start
+            if profile_decode_ms:
+                avg = sum(profile_decode_ms) / len(profile_decode_ms)
+                log(f"[PROFILE] W+G warp_decode: {avg:.2f} ms/frame "
+                    f"({len(profile_decode_ms)} frames, max {max(profile_decode_ms):.2f} ms)")
+            log(f"[PROFILE] animation loop: {animation_elapsed:.2f} s")
+            if cuda_device:
+                allocated = torch.cuda.max_memory_allocated(device) / 1024 ** 2
+                reserved = torch.cuda.max_memory_reserved(device) / 1024 ** 2
+                log(f"[PROFILE] CUDA peak allocated/reserved: "
+                    f"{allocated:.1f}/{reserved:.1f} MiB")
 
         mkdir(args.output_dir)
         wfp_concat = None
