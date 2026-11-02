@@ -24,6 +24,7 @@ class ArgumentConfig(PrintableConfig):
     flag_force_cpu: bool = False  # force cpu inference, WIP!
     flag_detectors_cpu: bool = False  # run animal/human landmark detectors on CPU, keep F/M/W/G on GPU
     flag_stream_video: bool = False  # animal only: encode frames immediately instead of retaining all outputs
+    flag_stream_driving_video: bool = False  # animal only: decode driving video frame-by-frame when not cropping
     flag_save_concat_video: bool = True  # animal only: include the diagnostic side-by-side video
     flag_save_gif: bool = True  # animal only: generate GIF preview after MP4 encoding
     flag_normalize_lip: bool = False  # whether to let the lip to close state before animation, only take effect when flag_eye_retargeting and flag_lip_retargeting is False

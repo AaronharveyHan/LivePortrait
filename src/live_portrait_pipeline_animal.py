@@ -26,6 +26,7 @@ from .utils.cropper import Cropper
 from .utils.camera import get_rotation_matrix
 from .utils.video import images2video, concat_frames, get_fps, add_audio_to_video, has_audio_stream, video2gif
 from .utils.animal_stream_writer import AnimalStreamWriter
+from .utils.animal_video_reader import iter_video_frames_rgb
 from .utils.crop import _transform_img, prepare_paste_back, paste_back
 from .utils.io import load_image_rgb, load_video, resize_to_limit, dump, load
 from .utils.helper import mkdir, basename, dct2device, is_video, is_template, remove_suffix, is_image, calc_motion_multiplier
@@ -51,18 +52,21 @@ class LivePortraitPipelineAnimal(object):
         )
 
     def make_motion_template(self, I_lst, **kwargs):
-        n_frames = len(I_lst)
+        # Accept both preloaded image lists (legacy) and lazy video-frame
+        # generators. Keep only the small pose/landmark arrays in the template.
+        preview_frames = kwargs.get('preview_frames')
         template_dct = {
-            'n_frames': n_frames,
+            'n_frames': 0,
             'output_fps': kwargs.get('output_fps', 25),
             'motion': [],
         }
 
-        for i in track(range(n_frames), description='Making driving motion templates...', total=n_frames):
-            # collect s, R, δ and t for inference
-            # Prepare one frame at a time; never upload the whole driving clip to the GPU.
-            I_i = (self.live_portrait_wrapper_animal.prepare_source(I_lst[i])
-                   if isinstance(I_lst, (list, tuple, np.ndarray)) else I_lst[i])
+        for frame in track(I_lst, description='Making driving motion templates...'):
+            # The generator gives us RGB uint8; upload only this frame.
+            if preview_frames is not None:
+                preview_frames.append(frame)
+            I_i = (self.live_portrait_wrapper_animal.prepare_source(frame)
+                   if isinstance(frame, np.ndarray) else frame)
             x_i_info = self.live_portrait_wrapper_animal.get_kp_info(I_i)
             R_i = get_rotation_matrix(x_i_info['pitch'], x_i_info['yaw'], x_i_info['roll'])
 
@@ -75,6 +79,7 @@ class LivePortraitPipelineAnimal(object):
 
             template_dct['motion'].append(item_dct)
 
+        template_dct['n_frames'] = len(template_dct['motion'])
         return template_dct
 
     def execute(self, args: ArgumentConfig):
@@ -83,10 +88,25 @@ class LivePortraitPipelineAnimal(object):
         device = self.live_portrait_wrapper_animal.device
         crop_cfg = self.cropper.crop_cfg
         stream_video = getattr(args, 'flag_stream_video', False)
+        stream_driving_video = getattr(args, 'flag_stream_driving_video', False)
         save_concat_video = getattr(args, 'flag_save_concat_video', True)
         save_gif = getattr(args, 'flag_save_gif', True)
         profile_enabled = os.getenv("LIVEPORTRAIT_PROFILE", "0").lower() in ("1", "true", "yes")
         profile_decode_ms = []
+        rss_process = None
+        if profile_enabled:
+            try:
+                import psutil  # optional; not needed for CPU unit tests
+                rss_process = psutil.Process()
+            except ImportError:
+                log('[PROFILE] Install psutil to sample process RSS (optional).')
+
+        def sample_rss(stage):
+            if rss_process is not None:
+                rss_mib = rss_process.memory_info().rss / (1024 ** 2)
+                log(f'[PROFILE] RSS sampled ({stage}): {rss_mib:.1f} MiB')
+
+        sample_rss('start')
         cuda_device = str(device).startswith("cuda")
         if profile_enabled and cuda_device:
             torch.cuda.reset_peak_memory_stats(device)
@@ -102,6 +122,7 @@ class LivePortraitPipelineAnimal(object):
         ######## process driving info ########
         flag_load_from_template = is_template(args.driving)
         driving_rgb_crop_256x256_lst = None
+        driving_preview_from_file = False
         wfp_template = None
 
         if flag_load_from_template:
@@ -122,26 +143,49 @@ class LivePortraitPipelineAnimal(object):
             output_fps = int(get_fps(args.driving))
             log(f"Load driving video from: {args.driving}, FPS is {output_fps}")
 
-            driving_rgb_lst = load_video(args.driving)
-            n_frames = len(driving_rgb_lst)
-
-            ######## make motion template ########
             log("Start making driving motion template...")
-            if inf_cfg.flag_crop_driving_video:
-                ret_d = self.cropper.crop_driving_video(driving_rgb_lst)
-                log(f'Driving video is cropped, {len(ret_d["frame_crop_lst"])} frames are processed.')
-                if len(ret_d["frame_crop_lst"]) != n_frames:
-                    n_frames = min(n_frames, len(ret_d["frame_crop_lst"]))
-                driving_rgb_crop_lst = ret_d['frame_crop_lst']
-                driving_rgb_crop_256x256_lst = [cv2.resize(_, (256, 256)) for _ in driving_rgb_crop_lst]
+            if stream_driving_video and not inf_cfg.flag_crop_driving_video:
+                # V0.3: decode + resize one RGB frame at a time. If the
+                # generated output is also streamed, a second decoder pass
+                # supplies concat previews without caching a full frame list.
+                preview_frames = ([] if save_concat_video and not stream_video
+                                  else None)
+                driving_frames = iter_video_frames_rgb(args.driving, resize=(256, 256))
+                try:
+                    driving_template_dct = self.make_motion_template(
+                        driving_frames, output_fps=output_fps,
+                        preview_frames=preview_frames,
+                    )
+                finally:
+                    driving_frames.close()
+                n_frames = driving_template_dct['n_frames']
+                if n_frames == 0:
+                    raise ValueError(f'Driving video contains no decodable frames: {args.driving}')
+                driving_rgb_crop_256x256_lst = preview_frames
+                driving_preview_from_file = bool(save_concat_video and stream_video)
+                log(f'[V0.3] Streaming driving decode: {n_frames} frames; '
+                    f'preview caching: {preview_frames is not None}')
             else:
-                driving_rgb_crop_256x256_lst = [cv2.resize(_, (256, 256)) for _ in driving_rgb_lst]  # force to resize to 256x256
-            #######################################
+                if stream_driving_video and inf_cfg.flag_crop_driving_video:
+                    log('[V0.3] Driving crop/tracking requires the legacy '
+                        'full-video path; streaming decode disabled for this input.')
+                driving_rgb_lst = load_video(args.driving)
+                n_frames = len(driving_rgb_lst)
+                if inf_cfg.flag_crop_driving_video:
+                    ret_d = self.cropper.crop_driving_video(driving_rgb_lst)
+                    log(f'Driving video is cropped, {len(ret_d["frame_crop_lst"])} frames are processed.')
+                    if len(ret_d["frame_crop_lst"]) != n_frames:
+                        n_frames = min(n_frames, len(ret_d["frame_crop_lst"]))
+                    driving_rgb_crop_lst = ret_d['frame_crop_lst']
+                    driving_rgb_crop_256x256_lst = [cv2.resize(_, (256, 256)) for _ in driving_rgb_crop_lst]
+                else:
+                    driving_rgb_crop_256x256_lst = [cv2.resize(_, (256, 256)) for _ in driving_rgb_lst]
+                # V0.2: even the fallback path uploads just one frame at a time.
+                driving_template_dct = self.make_motion_template(
+                    driving_rgb_crop_256x256_lst, output_fps=output_fps,
+                )
 
-            # save the motion template
-            # Keep driving frames on CPU; make_motion_template uploads one frame at a time.
-            I_d_lst = driving_rgb_crop_256x256_lst
-            driving_template_dct = self.make_motion_template(I_d_lst, output_fps=output_fps)
+            # save the motion template in the original pickle format
 
             wfp_template = remove_suffix(args.driving) + '.pkl'
             dump(wfp_template, driving_template_dct)
@@ -150,6 +194,7 @@ class LivePortraitPipelineAnimal(object):
         else:
             raise Exception(f"{args.driving} not exists or unsupported driving info types!")
 
+        sample_rss('driving ready')
         ######## prepare for pasteback ########
         I_p_pstbk_lst = None
         if inf_cfg.flag_pasteback and inf_cfg.flag_do_crop and inf_cfg.flag_stitching:
@@ -189,6 +234,8 @@ class LivePortraitPipelineAnimal(object):
                 output_path=stream_output, concat_path=stream_concat,
                 fps=output_fps, source_image=img_crop_256x256
             )
+        driving_preview_iter = (iter_video_frames_rgb(args.driving, resize=(256, 256))
+                                if driving_preview_from_file else None)
         animation_start = time.perf_counter() if profile_enabled else None
         try:
             for i in track(range(n_frames), description='🚀Animating...', total=n_frames):
@@ -236,16 +283,30 @@ class LivePortraitPipelineAnimal(object):
                         I_p_pstbk_lst.append(I_p_pstbk)
 
                 if stream_writer is not None:
+                    if driving_preview_iter is not None:
+                        try:
+                            driving_frame = next(driving_preview_iter)
+                        except StopIteration as exc:
+                            raise RuntimeError('Driving video changed between '
+                                               'motion and preview decode passes') from exc
+                    else:
+                        driving_frame = (driving_rgb_crop_256x256_lst[i]
+                                         if driving_rgb_crop_256x256_lst is not None
+                                         else None)
                     stream_writer.write(
                         I_p_i,
                         output_frame=I_p_pstbk if pasteback_enabled else I_p_i,
-                        driving_frame=(driving_rgb_crop_256x256_lst[i]
-                                       if driving_rgb_crop_256x256_lst is not None else None),
+                        driving_frame=driving_frame,
                     )
         finally:
-            if stream_writer is not None:
-                stream_writer.close()
+            try:
+                if stream_writer is not None:
+                    stream_writer.close()
+            finally:
+                if driving_preview_iter is not None:
+                    driving_preview_iter.close()
 
+        sample_rss('animation done')
         if profile_enabled:
             animation_elapsed = time.perf_counter() - animation_start
             if profile_decode_ms:
