@@ -42,6 +42,40 @@ class JawTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'non-monotone'):
             v.calibrate_openings(bad,self.names)
 
+    def test_geometry_peak_uses_aperture_apex_not_last_photo(self):
+        p2=self.p1.copy();p2[3,1]+=30;p2[4,1]+=30
+        p3=self.p1.copy();p3[3,1]+=10;p3[4,1]+=10
+        fs=[{'alpha':0.,'points':self.p0},
+            {'alpha':.333333,'points':self.m},
+            {'alpha':.666667,'points':p2},
+            {'alpha':1.,'points':p3}]
+        with self.assertRaisesRegex(ValueError,'non-monotone'):
+            v.calibrate_openings(fs,self.names,mode='geometry')
+        pos,raw=v.calibrate_openings(fs,self.names,mode='geometry_peak')
+        self.assertEqual(len(pos),4)
+        self.assertEqual(pos[0],0.)
+        self.assertEqual(pos[2],1.)
+        self.assertLess(pos[3],1.)
+        self.assertAlmostEqual(v.opening_to_time(1.,pos,fs),.666667)
+        self.assertAlmostEqual(v.opening_to_time(pos[1],pos,fs),.333333)
+        self.assertAlmostEqual(v.opening_to_time(.5,pos,fs),
+                               float(np.interp(.5,pos[:3],[0.,.333333,.666667])))
+
+    def test_geometry_peak_rejects_second_rise(self):
+        p2=self.p1.copy();p2[3,1]+=30;p2[4,1]+=30
+        p3=self.p1.copy();p3[3,1]+=15;p3[4,1]+=15
+        p4=self.p1.copy();p4[3,1]+=20;p4[4,1]+=20
+        fs=[{'alpha':a,'points':p} for a,p in
+            [(0.,self.p0),(.25,self.m),(.5,p2),(.75,p3),(1.,p4)]]
+        with self.assertRaisesRegex(ValueError,'second opening rise'):
+            v.calibrate_openings(fs,self.names,mode='geometry_peak')
+
+    def test_opening_to_time_rejects_invalid_positions(self):
+        for pos in ([0.,.9,.8], [0.,1.,.5, .7], [0.,.5,.5]):
+            fs=[{'alpha':float(i)/(len(pos)-1)} for i in range(len(pos))]
+            with self.subTest(pos=pos),self.assertRaises(ValueError):
+                v.opening_to_time(.5,pos,fs)
+
     def test_invalid_opening_points(self):
         bad=self.p0.copy();bad[3]=bad[1]
         with self.assertRaisesRegex(ValueError,'Lower lip'):

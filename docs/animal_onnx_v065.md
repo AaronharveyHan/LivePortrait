@@ -110,3 +110,21 @@ Outputs: `comparison_sheet.png`, `report.json`, `mouth_v064_flow_*.png`, `mouth_
 - The tongue texture is scaled/translated approximately. No tongue-root tracking, topology-changing surface rendering or true occlusion. Users may still see popping, lip/tongue overlap or visibly artificial stretching.
 - Independent tongue control allows physically impossible combinations (fully closed jaw with a large visible tongue). Select appropriate controls or implement an explicit geometric constraint later.
 - The parser and asset files do not change any older source code, model graph, or checkpoint.
+
+
+### V0.6.5 geometry_peak opt-in hotfix (non-monotone aperture)
+
+`--opening-mode geometry` still rejects non-monotone measured reference opening.
+Use `--opening-mode geometry_peak` only when the measured jaw aperture
+increases strictly up to a single peak, then falls or remains below the peak.
+It normalizes 0–1 over the increasing branch and maps `opening=1` to the
+**measured peak frame** (not necessarily the chronologically last frame).
+Post-peak references remain available to the texture-selection pool, but they
+are excluded from increasing-opening interpolation. This mode is **not** a
+closing-phase solver; a natural yawn closing movement requires a separate
+opening/closing phase model. Do not alter landmark coordinates to hide failures.
+
+For the current dog Frame 0..3 experiment, ratios 1.168516, 1.447986,
+1.783965, 1.577531 result in peak at Frame 2 (time alpha ~0.666667).
+Expect normalized positions approximately [0, 0.454, 1, 0.666].
+Examine `peak_diagnostic` in report.json before accepting results.

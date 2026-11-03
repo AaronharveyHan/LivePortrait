@@ -63,6 +63,27 @@ class V065CLITests(unittest.TestCase):
         a=cli.parser().parse_args(['--mid','0.45='+str(self.paths[1]),'--plan'])
         self.assertEqual(cli.main(['--mid','0.45='+str(self.paths[1]),'--plan']),0)
 
+    def test_geometry_peak_parser_and_requires_verified_midpoints(self):
+        a=cli.parser().parse_args(self.base+['--opening-mode','geometry_peak'])
+        self.assertEqual(a.opening_mode,'geometry_peak')
+        a.mid_points=None
+        with self.assertRaisesRegex(ValueError,'mid-points'):
+            cli.validate_args(a)
+
+    def test_geometry_peak_runs_with_post_peak_reference(self):
+        middle=json.loads(self.midpoints.read_text(encoding='utf-8'))
+        # Put midpoint aperture above open endpoint; image source and hash
+        # remain unchanged. This is a deliberate diagnostic geometry fixture.
+        middle['frames']['0.45']['lower_lip'][1]+=.025
+        self.midpoints.write_text(json.dumps(middle),encoding='utf-8')
+        a,vals=self.args(['--opening-mode','geometry_peak'])
+        result=cli.run(a,*vals)
+        self.assertEqual(result['opening_mode'],'geometry_peak')
+        self.assertLess(result['reference_openings_normalized'][-1],1)
+        self.assertEqual(result['peak_diagnostic']['measured_peak_time_alpha'],.45)
+        self.assertTrue(result['peak_diagnostic']['opening_ends_at_measured_peak'])
+        self.assertTrue(result['outside_roi_changed_all_zero'])
+
     def test_requires_mid_points(self):
         a=cli.parser().parse_args([v for v in self.base if v not in ('--mid-points',str(self.midpoints))])
         with self.assertRaisesRegex(ValueError,'mid-points'):

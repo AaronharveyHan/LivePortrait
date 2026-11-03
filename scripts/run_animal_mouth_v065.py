@@ -29,7 +29,8 @@ def parser():
     p.add_argument('--alignment',choices=('translation','none'),default='translation')
     p.add_argument('--max-shift',type=float,default=20)
     p.add_argument('--same-dog',action='store_true')
-    p.add_argument('--opening-mode',choices=('geometry','time'),default='geometry',help='geometry=measured aperture, time=explicit diagnostic fallback')
+    p.add_argument('--opening-mode',choices=('geometry','geometry_peak','time'),default='geometry',
+                   help='geometry=strict monotone; geometry_peak=open to measured peak then ignore closing branch; time=diagnostic only')
     p.add_argument('--init-tongue',action='store_true',help='Generate offline HTML to hand-draw tongue polygons on each aligned reference')
     p.add_argument('--tongue-manifest',type=Path,help='Human-verified exported tongue polygons JSON')
     p.add_argument('--openings',default='0,0.25,0.5,0.75,1',help='Target measured normalized jaw opening 0..1 (not frame time)')
@@ -85,7 +86,7 @@ def validate_args(args):
         raise ValueError('User must assert --same-dog')
     if args.landmarks is None or not args.landmarks.is_file():
         raise FileNotFoundError('--landmarks verified endpoint JSON is required')
-    if args.mid_points is None and args.opening_mode=='geometry':
+    if args.mid_points is None and args.opening_mode in ('geometry','geometry_peak'):
         raise ValueError('Measured --opening-mode geometry needs human-verified --mid-points')
     if args.mid_points is not None and not args.mid_points.is_file():
         raise FileNotFoundError('--mid-points JSON missing')
@@ -231,6 +232,15 @@ def run(args,openings,tongue_values,tongue_source,mids,holdout):
         print(json.dumps(result,indent=2,ensure_ascii=False))
         return result
     positions,raw_ratios=calibrate_openings(frames,names,mode=args.opening_mode)
+    peak_index=int(np.argmax(raw_ratios))
+    peak_diagnostic={'measured_peak_frame_index':peak_index,
+                     'measured_peak_time_alpha':float(frames[peak_index]['alpha']),
+                     'post_peak_reference_time_alphas':[float(f['alpha']) for f in frames[peak_index+1:]],
+                     'opening_ends_at_measured_peak':args.opening_mode=='geometry_peak',
+                     'note':('geometry_peak excludes post-peak frames from opening interpolation; '
+                             'they remain in the source/texture pool. No closing-motion interpolation is inferred.'
+                             if args.opening_mode=='geometry_peak' else
+                             'Measured peak diagnostic only; strict geometry/time calibration remains unchanged.')}
     manifest=json.loads(args.tongue_manifest.read_text(encoding='utf-8'))
     polygons=validate_tongue_manifest(manifest,frames,hashes,roi)
     cavity,masks=prepare_cavity_frames(frames,polygons)
@@ -286,7 +296,8 @@ def run(args,openings,tongue_values,tongue_source,mids,holdout):
     report={'schema_version':1,'stage':'v0.6.5_independent_jaw_tongue',
             'reference_dir':str(args.reference_dir),'reference_alphas_time':[f['alpha'] for f in frames],
             'reference_openings_normalized':positions,'reference_aperture_width_ratios':raw_ratios,
-            'opening_mode':args.opening_mode,'opening_target_values':list(openings),
+            'opening_mode':args.opening_mode,'peak_diagnostic':peak_diagnostic,
+            'opening_target_values':list(openings),
             'tongue_target_values':list(tongue_values),'tongue_target_source':tongue_source,
             'reference_alignment':notes,'tongue_manifest':str(args.tongue_manifest),
             'tongue_manifest_sha256':old.sha(args.tongue_manifest),'tongue_reference_source':audits[0]['source_tongue_alpha'],
@@ -305,7 +316,8 @@ def run(args,openings,tongue_values,tongue_source,mids,holdout):
     (args.output_dir/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2,allow_nan=False)+'\n',encoding='utf-8')
     result={'stage':report['stage'],'output_dir':str(args.output_dir),
             'comparison_sheet':str(args.output_dir/'comparison_sheet.png'),
-            'measured_opening_positions':positions,'tongue_source':tongue_source,
+            'measured_opening_positions':positions,'peak_diagnostic':peak_diagnostic,
+            'tongue_source':tongue_source,
             'continuity_all_pass':continuity['all_pass'],
             'outside_roi_changed_all_zero':report['outside_roi_changed_all_zero'],
             'holdout_roi_mae':evaluation['mouth_roi_mae'] if evaluation else None}

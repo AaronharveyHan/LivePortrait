@@ -41,31 +41,67 @@ def jaw_aperture(points, names):
 
 
 def calibrate_openings(frames, names, *, mode='geometry'):
-    """Return monotone measured-state opening positions in [0,1].
+    """Calibrate jaw opening from manual landmarks.
 
-    Explicitly reject geometry that is inconsistent with increasing source
-    jaw opening. Never silently relabel source states as equally spaced.
+    geometry: strict time-ordered monotone opening, unchanged from V0.6.5.
+    geometry_peak: use only the *increasing* branch through the first maximum
+    as 0..1 opening. Later closing frames remain in the source data but are
+    never used to infer increased opening. This is not a closing animation.
+    time: diagnostic chronological control, not measured jaw opening.
     """
-    if mode not in ('geometry', 'time'):
-        raise ValueError('opening mode must be geometry or time')
+    if mode not in ('geometry', 'geometry_peak', 'time'):
+        raise ValueError('opening mode must be geometry, geometry_peak or time')
     ratios = [jaw_aperture(f['points'], names) for f in frames]
     if mode == 'time':
         return [float(f['alpha']) for f in frames], ratios
-    span = ratios[-1] - ratios[0]
-    if span <= 0.02:
-        raise ValueError('Insufficient measured opening change; check mouth points')
+    if mode == 'geometry':
+        span = ratios[-1] - ratios[0]
+        if span <= 0.02:
+            raise ValueError('Insufficient measured opening change; check mouth points')
+        positions = [(x-ratios[0]) / span for x in ratios]
+        if any(y-x < 0.005 for x,y in zip(positions,positions[1:])):
+            raise ValueError('Opening measures non-monotone or too close: check verified points, or use --opening-mode time for DIAGNOSTIC only')
+        return [float(np.clip(x,0,1)) for x in positions], ratios
+
+    # Explicit opt-in. This may shorten the opening trajectory: the reference
+    # image at chronological alpha=1 is NOT necessarily the maximum aperture.
+    peak = int(np.argmax(ratios))
+    span = ratios[peak] - ratios[0]
+    if peak == 0 or span <= 0.02:
+        raise ValueError('geometry_peak needs a measured opening peak later than the first frame')
     positions = [(x-ratios[0]) / span for x in ratios]
-    if any(y-x < 0.005 for x,y in zip(positions,positions[1:])):
-        raise ValueError('Opening measures non-monotone or too close: check verified points, or use --opening-mode time for DIAGNOSTIC only')
-    return [float(np.clip(x,0,1)) for x in positions], ratios
+    if any(b-a < 0.005 for a,b in zip(positions[:peak], positions[1:peak+1])):
+        raise ValueError('geometry_peak opening branch is non-monotone or too close; check landmarks')
+    if any(b-a > 0.005 for a,b in zip(positions[peak:-1], positions[peak+1:])):
+        raise ValueError('geometry_peak has a second opening rise after the peak; split the motion into phases')
+    if any(x < -0.005 for x in positions):
+        raise ValueError('geometry_peak contains a closing state below the first reference; use a separate phase')
+    return [float(x) for x in positions], ratios
 
 
 def opening_to_time(opening, positions, frames):
+    """Invert an opening-only reference curve; excludes post-peak closure.
+
+    Strict geometry/time have monotone positions and behave as before.
+    geometry_peak positions end below their maximum; map only through the
+    maximum and never silently sort/reference a closing photo as open=1.
+    """
     if not isinstance(opening, (int,float)) or isinstance(opening,bool) or not math.isfinite(opening) or not 0<=opening<=1:
         raise ValueError('Opening must be finite in [0,1]')
-    if len(positions)!=len(frames):
+    if len(positions)!=len(frames) or not positions:
         raise ValueError('Position / reference mismatch')
-    return float(np.interp(float(opening), positions, [f['alpha'] for f in frames]))
+    pos=np.asarray(positions, dtype=np.float64)
+    if not np.all(np.isfinite(pos)):
+        raise ValueError('Opening positions must be finite')
+    peak=int(np.argmax(pos))
+    if abs(pos[0]) > 1e-6 or abs(pos[peak]-1) > 1e-6:
+        raise ValueError('Opening positions must start at 0 and reach 1 at the peak')
+    if np.any(np.diff(pos[:peak+1]) <= 0):
+        raise ValueError('Opening branch must be strictly increasing')
+    if np.any(np.diff(pos[peak:]) > 0):
+        raise ValueError('Post-peak reference positions cannot rise; use separate phases')
+    return float(np.interp(float(opening), pos[:peak+1],
+                           [f['alpha'] for f in frames[:peak+1]]))
 
 
 def default_tongue_amount(opening):
